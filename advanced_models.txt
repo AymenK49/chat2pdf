@@ -1,0 +1,193 @@
+            # Adjust confidence based on answer quality
+            answer = result['answer'].strip()
+            if len(answer) < 3:
+                confidence *= 0.5
+            elif len(answer) > 100:
+                confidence *= 0.9
+            
+            # Check if answer seems relevant
+            question_words = set(question.lower().split())
+            answer_words = set(answer.lower().split())
+            overlap = len(question_words.intersection(answer_words))
+            if overlap == 0:
+                confidence *= 0.7
+            
+            return {
+                "answer": answer,
+                "confidence": float(confidence),
+                "start": result.get('start', 0),
+                "end": result.get('end', len(answer))
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in QA processing: {e}")
+            return {
+                "answer": "Error processing question",
+                "confidence": 0.0
+            }
+    
+    def _unload_current_model(self):
+        """Unload current model to free memory"""
+        if self.current_language and self.models[self.current_language]['pipeline']:
+            del self.models[self.current_language]['pipeline']
+            self.models[self.current_language]['pipeline'] = None
+            gc.collect()
+            logger.info(f"Unloaded QA model for {self.current_language}")
+    
+    def get_memory_usage(self) -> Dict:
+        """Get current memory usage info"""
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        
+        return {
+            "rss_mb": memory_info.rss / 1024 / 1024,
+            "vms_mb": memory_info.vms / 1024 / 1024,
+            "percent": process.memory_percent()
+        }
+
+class ModelManager:
+    """Centralized model management with memory optimization"""
+    
+    def __init__(self, max_memory_mb: int = 3000):
+        self.max_memory_mb = max_memory_mb
+        self.qa_model = OptimizedQAModel()
+        self.generative_model = None
+        self.embedding_model = None
+        self.current_mode = "extractive"
+    
+    def set_mode(self, mode: str):
+        """Switch between extractive and generative modes"""
+        if mode == self.current_mode:
+            return
+        
+        if mode == "generative":
+            # Load generative model, unload QA if needed
+            if self._get_memory_usage() > self.max_memory_mb * 0.7:
+                self.qa_model._unload_current_model()
+            
+            if not self.generative_model:
+                self.generative_model = TinyLlamaGenerator()
+                self.generative_model.load_model(quantized=True)
+        
+        elif mode == "extractive":
+            # Unload generative model if loaded
+            if self.generative_model and self.generative_model.loaded:
+                self.generative_model.unload_model()
+        
+        self.current_mode = mode
+        logger.info(f"Switched to {mode} mode")
+    
+    def answer_question(self, question: str, context: str, language: str, mode: str = None) -> Dict:
+        """Answer question using specified mode"""
+        if mode:
+            self.set_mode(mode)
+        
+        if self.current_mode == "generative" and self.generative_model:
+            return self.generative_model.generate_answer(question, context, language)
+        else:
+            return self.qa_model.answer_question(question, context, language)
+    
+    def _get_memory_usage(self) -> float:
+        """Get current memory usage in MB"""
+        try:
+            import psutil
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024
+        except:
+            return 0.0
+    
+    def cleanup(self):
+        """Clean up all models"""
+        if self.generative_model:
+            self.generative_model.unload_model()
+        self.qa_model._unload_current_model()
+        gc.collect()
+
+# Performance optimization utilities
+class PerformanceOptimizer:
+    """Utilities for optimizing performance on CPU-only systems"""
+    
+    @staticmethod
+    def optimize_torch_settings():
+        """Optimize PyTorch settings for CPU"""
+        torch.set_num_threads(min(4, torch.get_num_threads()))
+        torch.set_num_interop_threads(1)
+        
+        # Disable unnecessary features
+        torch.backends.mkldnn.enabled = True
+        torch.backends.mkldnn.benchmark = True
+        
+        logger.info("PyTorch settings optimized for CPU")
+    
+    @staticmethod
+    def monitor_memory():
+        """Monitor memory usage"""
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            process = psutil.Process()
+            
+            return {
+                "system_total_gb": memory.total / 1024**3,
+                "system_available_gb": memory.available / 1024**3,
+                "system_percent": memory.percent,
+                "process_mb": process.memory_info().rss / 1024**2,
+                "process_percent": process.memory_percent()
+            }
+        except ImportError:
+            return {"error": "psutil not available"}
+    
+    @staticmethod
+    def optimize_faiss_index(index, use_compression: bool = True):
+        """Optimize FAISS index for memory efficiency"""
+        if use_compression and hasattr(index, 'ntotal') and index.ntotal > 1000:
+            # Use PCA for dimension reduction if many vectors
+            import faiss
+            
+            d = index.d
+            if d > 128:  # Only compress if dimension is large
+                pca_matrix = faiss.PCAMatrix(d, min(64, d//2))
+                compressed_index = faiss.IndexPreTransform(pca_matrix, index)
+                return compressed_index
+        
+        return index
+
+# Batch processing utilities
+class BatchProcessor:
+    """Handle batch processing for better performance"""
+    
+    def __init__(self, batch_size: int = 16):
+        self.batch_size = batch_size
+    
+    def process_embeddings_batch(self, model, texts: List[str]) -> List:
+        """Process embeddings in batches"""
+        embeddings = []
+        
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i:i + self.batch_size]
+            batch_embeddings = model.encode(batch, convert_to_numpy=True)
+            embeddings.extend(batch_embeddings)
+            
+            # Optional: Clear cache periodically
+            if i % (self.batch_size * 4) == 0:
+                gc.collect()
+        
+        return embeddings
+    
+    def process_qa_batch(self, qa_model, questions: List[str], contexts: List[str]) -> List[Dict]:
+        """Process QA in batches"""
+        results = []
+        
+        for i in range(0, len(questions), self.batch_size):
+            batch_questions = questions[i:i + self.batch_size]
+            batch_contexts = contexts[i:i + self.batch_size]
+            
+            batch_results = []
+            for q, c in zip(batch_questions, batch_contexts):
+                result = qa_model(question=q, context=c)
+                batch_results.append(result)
+            
+            results.extend(batch_results)
+        
+        return results
